@@ -1,27 +1,26 @@
-/* The MIT License
+/*  vcfconcat.c -- Concatenate or combine VCF/BCF files.
 
-   Copyright (c) 2013-2014 Genome Research Ltd.
-   Authors:  see http://github.com/samtools/bcftools/blob/master/AUTHORS
+    Copyright (C) 2013-2014 Genome Research Ltd.
 
-   Permission is hereby granted, free of charge, to any person obtaining a copy
-   of this software and associated documentation files (the "Software"), to deal
-   in the Software without restriction, including without limitation the rights
-   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-   copies of the Software, and to permit persons to whom the Software is
-   furnished to do so, subject to the following conditions:
+    Author: Petr Danecek <pd3@sanger.ac.uk>
 
-   The above copyright notice and this permission notice shall be included in
-   all copies or substantial portions of the Software.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-   THE SOFTWARE.
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
 
- */
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.  */
 
 #include <stdio.h>
 #include <unistd.h>
@@ -49,8 +48,8 @@ typedef struct _args_t
     int nbuf, mbuf, prev_chr, min_PQ, prev_pos_check;
     int32_t *GTa, *GTb, mGTa, mGTb, *phase_qual, *phase_set;
 
-    char **argv, *file_list, **fnames;
-    int argc, nfnames, allow_overlaps, phased_concat;
+    char **argv, *output_fname, *file_list, **fnames, *regions_list;
+    int argc, nfnames, allow_overlaps, phased_concat, remove_dups, regions_is_file;
 }
 args_t;
 
@@ -73,13 +72,13 @@ static void init_data(args_t *args)
     {
         htsFile *fp = hts_open(args->fnames[i], "r"); if ( !fp ) error("Failed to open: %s\n", args->fnames[i]);
         bcf_hdr_t *hdr = bcf_hdr_read(fp); if ( !hdr ) error("Failed to parse header: %s\n", args->fnames[i]);
-        if ( !args->out_hdr ) 
+        if ( !args->out_hdr )
             args->out_hdr = bcf_hdr_dup(hdr);
         else
         {
             bcf_hdr_combine(args->out_hdr, hdr);
 
-            if ( bcf_hdr_nsamples(hdr) != bcf_hdr_nsamples(args->out_hdr) ) 
+            if ( bcf_hdr_nsamples(hdr) != bcf_hdr_nsamples(args->out_hdr) )
                 error("Different number of samples in %s. Perhaps \"bcftools merge\" is what you are looking for?\n", args->fnames[i]);
 
             int j;
@@ -112,15 +111,22 @@ static void init_data(args_t *args)
         bcf_hdr_append(args->out_hdr,"##FORMAT=<ID=PS,Number=1,Type=Integer,Description=\"Phase Set\">");
     }
     bcf_hdr_append_version(args->out_hdr, args->argc, args->argv, "bcftools_concat");
-    args->out_fh = hts_open("-",hts_bcf_wmode(args->output_type));
+    args->out_fh = hts_open(args->output_fname,hts_bcf_wmode(args->output_type));
+    if ( args->out_fh == NULL ) error("Can't write to \"%s\": %s\n", args->output_fname, strerror(errno));
+
     bcf_hdr_write(args->out_fh, args->out_hdr);
 
-    if ( args->allow_overlaps ) 
+    if ( args->allow_overlaps )
     {
         args->files = bcf_sr_init();
         args->files->require_index = 1;
+        if ( args->regions_list )
+        {
+            if ( bcf_sr_set_regions(args->files, args->regions_list, args->regions_is_file)<0 )
+                error("Failed to read the regions: %s\n", args->regions_list);
+        }
         for (i=0; i<args->nfnames; i++)
-            if ( !bcf_sr_add_reader(args->files,args->fnames[i]) ) error("Failed to open, is the file indexed? %s\n", args->fnames[i]);
+            if ( !bcf_sr_add_reader(args->files,args->fnames[i]) ) error("Failed to open %s: %s\n", args->fnames[i],bcf_sr_strerror(args->files->errnum));
     }
     else if ( args->phased_concat )
     {
@@ -188,7 +194,7 @@ static void phase_update(args_t *args, bcf_hdr_t *hdr, bcf1_t *rec)
     {
         if ( !args->swap_phase[i] ) continue;
         int *gt = &args->GTa[i*2];
-        if ( gt[0]==bcf_gt_missing || gt[1]==bcf_int32_vector_end ) continue;
+        if ( bcf_gt_is_missing(gt[0]) || gt[1]==bcf_int32_vector_end ) continue;
         SWAP(int, gt[0], gt[1]);
         gt[1] |= 1;
     }
@@ -221,7 +227,7 @@ static void phased_flush(args_t *args)
             int *gta = &args->GTa[j*2];
             int *gtb = &args->GTb[j*2];
             if ( gta[1]==bcf_int32_vector_end || gtb[1]==bcf_int32_vector_end ) continue;
-            if ( gta[0]==bcf_gt_missing || gta[1]==bcf_gt_missing || gtb[0]==bcf_gt_missing || gtb[1]==bcf_gt_missing ) continue;
+            if ( bcf_gt_is_missing(gta[0]) || bcf_gt_is_missing(gta[1]) || bcf_gt_is_missing(gtb[0]) || bcf_gt_is_missing(gtb[1]) ) continue;
             if ( !bcf_gt_is_phased(gta[1]) || !bcf_gt_is_phased(gtb[1]) ) continue;
             if ( bcf_gt_allele(gta[0])==bcf_gt_allele(gta[1]) || bcf_gt_allele(gtb[0])==bcf_gt_allele(gtb[1]) ) continue;
             if ( bcf_gt_allele(gta[0])==bcf_gt_allele(gtb[0]) && bcf_gt_allele(gta[1])==bcf_gt_allele(gtb[1]) )
@@ -292,13 +298,18 @@ static void phased_flush(args_t *args)
 
 static void phased_push(args_t *args, bcf1_t *arec, bcf1_t *brec)
 {
+    if ( arec && arec->errcode )
+        error("Parse error at %s:%d, cannot proceed: %s\n", bcf_seqname(args->files->readers[0].header,arec),arec->pos+1, args->files->readers[0].fname);
+    if ( brec && brec->errcode )
+        error("Parse error at %s:%d, cannot proceed: %s\n", bcf_seqname(args->files->readers[1].header,brec),brec->pos+1, args->files->readers[1].fname);
+
     int i, nsmpl = bcf_hdr_nsamples(args->out_hdr);
     int chr_id = bcf_hdr_name2id(args->out_hdr, bcf_seqname(args->files->readers[0].header,arec));
     if ( args->prev_chr<0 || args->prev_chr!=chr_id )
     {
         if ( args->prev_chr>=0 ) phased_flush(args);
 
-        for (i=0; i<nsmpl; i++) 
+        for (i=0; i<nsmpl; i++)
             args->phase_set[i] = arec->pos+1;
 
         if ( args->seen_seq[chr_id] ) error("The chromosome block %s is not contiguous\n", bcf_seqname(args->files->readers[0].header,arec));
@@ -342,7 +353,7 @@ static void concat(args_t *args)
             int new_file = 0;
             while ( args->files->nreaders < 2 && args->ifname < args->nfnames )
             {
-                if ( !bcf_sr_add_reader(args->files,args->fnames[args->ifname]) ) error("Failed to open %s\n", args->fnames[args->ifname]);
+                if ( !bcf_sr_add_reader(args->files,args->fnames[args->ifname]) ) error("Failed to open %s: %s\n", args->fnames[args->ifname],bcf_sr_strerror(args->files->errnum));
                 new_file = 1;
 
                 args->ifname++;
@@ -360,7 +371,7 @@ static void concat(args_t *args)
                 seek_pos = line->pos;
                 seek_chr = bcf_hdr_name2id(args->out_hdr, bcf_seqname(args->files->readers[0].header,line));
             }
-            else if ( new_file ) 
+            else if ( new_file )
                 bcf_sr_seek(args->files,NULL,0);  // set to start
 
             int nret;
@@ -389,7 +400,7 @@ static void concat(args_t *args)
                 while ( args->ifname < args->nfnames && args->start_pos[args->ifname]!=-1 && line->pos >= args->start_pos[args->ifname] )
                 {
                     must_seek = 1;
-                    bcf_sr_add_reader(args->files,args->fnames[args->ifname]);
+                    if ( !bcf_sr_add_reader(args->files,args->fnames[args->ifname]) ) error("Failed to open %s: %s\n", args->fnames[args->ifname],bcf_sr_strerror(args->files->errnum));
                     args->ifname++;
                 }
                 if ( must_seek )
@@ -414,7 +425,7 @@ static void concat(args_t *args)
             }
         }
     }
-    else if ( args->files )  // combining overlapping files, using synced reader 
+    else if ( args->files )  // combining overlapping files, using synced reader
     {
         while ( bcf_sr_next_line(args->files) )
         {
@@ -424,6 +435,7 @@ static void concat(args_t *args)
                 if ( !line ) continue;
                 bcf_translate(args->out_hdr, args->files->readers[i].header, line);
                 bcf_write1(args->out_fh, args->out_hdr, line);
+                if ( args->remove_dups ) break;
             }
         }
     }
@@ -447,8 +459,8 @@ static void concat(args_t *args)
                     tmp.l = 0;
                     kputsn(fp->line.s,str-fp->line.s,&tmp);
                     int chr_id = bcf_hdr_name2id(args->out_hdr, tmp.s);
-                    if ( chr_id<0 ) error("FIXME: sequence name %s in %s\n", tmp.s, args->fnames[i]);
-                    if ( prev_chr_id!=chr_id ) 
+                    if ( chr_id<0 ) error("The sequence \"%s\" not defined in the header: %s\n(Quick workaround: index the file.)\n", tmp.s, args->fnames[i]);
+                    if ( prev_chr_id!=chr_id )
                     {
                         prev_pos = -1;
                         if ( args->seen_seq[chr_id] )
@@ -473,7 +485,7 @@ static void concat(args_t *args)
                 {
                     bcf_translate(args->out_hdr, hdr, line);
 
-                    if ( prev_chr_id!=line->rid ) 
+                    if ( prev_chr_id!=line->rid )
                     {
                         prev_pos = -1;
                         if ( args->seen_seq[line->rid] )
@@ -507,11 +519,15 @@ static void usage(args_t *args)
     fprintf(stderr, "Usage:   bcftools concat [options] <A.vcf.gz> [<B.vcf.gz> [...]]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
-	fprintf(stderr, "   -a, --allow-overlaps           First coordinate of the next file can precede last record of the current file.\n");
-	fprintf(stderr, "   -f, --file-list <file>         Read the list of files from a file.\n");
-	fprintf(stderr, "   -l, --ligate                   Ligate phased VCFs by matching phase at overlapping haplotypes\n");
-	fprintf(stderr, "   -q, --min-PQ <int>             Break phase set if phasing quality is lower than <int> [30]\n");
-	fprintf(stderr, "   -O, --output-type <b|u|z|v>    b: compressed BCF, u: uncompressed BCF, z: compressed VCF, v: uncompressed VCF [v]\n");
+    fprintf(stderr, "   -a, --allow-overlaps           First coordinate of the next file can precede last record of the current file.\n");
+    fprintf(stderr, "   -D, --remove-duplicates        Output only once records present in multiple files.\n");
+    fprintf(stderr, "   -f, --file-list <file>         Read the list of files from a file.\n");
+    fprintf(stderr, "   -l, --ligate                   Ligate phased VCFs by matching phase at overlapping haplotypes\n");
+    fprintf(stderr, "   -q, --min-PQ <int>             Break phase set if phasing quality is lower than <int> [30]\n");
+    fprintf(stderr, "   -o, --output <file>            Write output to a file [standard output]\n");
+    fprintf(stderr, "   -O, --output-type <b|u|z|v>    b: compressed BCF, u: uncompressed BCF, z: compressed VCF, v: uncompressed VCF [v]\n");
+    fprintf(stderr, "   -r, --regions <region>         restrict to comma-separated list of regions\n");
+    fprintf(stderr, "   -R, --regions-file <file>      restrict to regions listed in a file\n");
     fprintf(stderr, "\n");
     exit(1);
 }
@@ -521,26 +537,39 @@ int main_vcfconcat(int argc, char *argv[])
     int c;
     args_t *args  = (args_t*) calloc(1,sizeof(args_t));
     args->argc    = argc; args->argv = argv;
+    args->output_fname = "-";
     args->output_type = FT_VCF;
     args->min_PQ  = 30;
 
-    static struct option loptions[] = 
+    static struct option loptions[] =
     {
+        {"regions",1,0,'r'},
+        {"regions-file",1,0,'R'},
+        {"remove-duplicates",0,0,'D'},
         {"allow-overlaps",0,0,'a'},
         {"ligate",0,0,'l'},
+        {"output",1,0,'o'},
         {"output-type",1,0,'O'},
         {"file-list",1,0,'f'},
         {"min-PQ",1,0,'q'},
         {0,0,0,0}
     };
-    while ((c = getopt_long(argc, argv, "h:?O:f:alq:",loptions,NULL)) >= 0) 
+    char *tmp;
+    while ((c = getopt_long(argc, argv, "h:?o:O:f:alq:Dr:R:",loptions,NULL)) >= 0)
     {
         switch (c) {
-    	    case 'q': args->min_PQ = atoi(optarg); break;
-    	    case 'a': args->allow_overlaps = 1; break;
-    	    case 'l': args->phased_concat = 1; break;
-    	    case 'f': args->file_list = optarg; break;
-    	    case 'O': 
+            case 'r': args->regions_list = optarg; break;
+            case 'R': args->regions_list = optarg; args->regions_is_file = 1; break;
+            case 'D': args->remove_dups = 1; break;
+            case 'q': 
+                args->min_PQ = strtol(optarg,&tmp,10);
+                if ( *tmp ) error("Could not parse argument: --min-PQ %s\n", optarg);
+                break;
+            case 'a': args->allow_overlaps = 1; break;
+            case 'l': args->phased_concat = 1; break;
+            case 'f': args->file_list = optarg; break;
+            case 'o': args->output_fname = optarg; break;
+            case 'O':
                 switch (optarg[0]) {
                     case 'b': args->output_type = FT_BCF_GZ; break;
                     case 'u': args->output_type = FT_BCF; break;
@@ -549,24 +578,28 @@ int main_vcfconcat(int argc, char *argv[])
                     default: error("The output type \"%s\" not recognised\n", optarg);
                 };
                 break;
-            case 'h': 
+            case 'h':
             case '?': usage(args); break;
             default: error("Unknown argument: %s\n", optarg);
         }
     }
-    while ( optind<argc ) 
-    { 
+    while ( optind<argc )
+    {
         args->nfnames++;
         args->fnames = (char **)realloc(args->fnames,sizeof(char*)*args->nfnames);
         args->fnames[args->nfnames-1] = strdup(argv[optind]);
         optind++;
     }
+    if ( args->allow_overlaps && args->phased_concat ) args->allow_overlaps = 0;
     if ( args->file_list )
     {
         if ( args->nfnames ) error("Cannot combine -l with file names on command line.\n");
         args->fnames = hts_readlines(args->file_list, &args->nfnames);
+        if ( !args->fnames ) error("Could not read the file: %s\n", args->file_list);
     }
     if ( !args->nfnames ) usage(args);
+    if ( args->remove_dups && !args->allow_overlaps ) error("The -D option is supported only with -a\n");
+    if ( args->regions_list && !args->allow_overlaps ) error("The -r/-R option is supported only with -a\n");
     init_data(args);
     concat(args);
     destroy_data(args);

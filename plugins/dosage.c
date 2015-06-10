@@ -1,21 +1,58 @@
+/*  plugins/dosage.c -- prints genotype dosage.
+
+    Copyright (C) 2014 Genome Research Ltd.
+
+    Author: Petr Danecek <pd3@sanger.ac.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <htslib/vcf.h>
 #include <math.h>
-#include "config.h"
+#include <getopt.h>
 
 
-/* 
-    This short description is used to generate the output of `bcftools annotate -l`.
+/*
+    This short description is used to generate the output of `bcftools plugin -l`.
 */
 const char *about(void)
 {
-    return 
-        "Prints genotype dosage determined from tags requested by the user.\n"
-        "By default the plugin searches for PL, GL and GT (in that order), thus\n"
-        "running with \"-p dosage\" is equivalent to \"-p dosage:tags=PL,GL,GT\".\n";
+    return "Prints genotype dosage determined from tags requested by the user.\n";
 }
 
+const char *usage(void)
+{
+    return 
+        "\n"
+        "About: Print genotype dosage\n"
+        "Usage: bcftools +dosage [General Options] -- [Plugin Options]\n"
+        "Options:\n"
+        "   run \"bcftools plugin\" for a list of common options\n"
+        "\n"
+        "Plugin options:\n"
+        "   -t, --tags <list>   VCF tags to determine the dosage from [PL,GL,GT]\n"
+        "\n"
+        "Example:\n"
+        "   bcftools +dosage in.vcf -- -t GT\n"
+        "\n";
+}
 
 bcf_hdr_t *in_hdr = NULL;
 int pl_type = 0, gl_type = 0;
@@ -99,10 +136,10 @@ int calc_dosage_GT(bcf1_t *rec)
     nret /= rec->n_sample;
     int32_t *ptr = (int32_t*) buf;
     for (i=0; i<rec->n_sample; i++)
-    { 
+    {
         float dsg = 0;
         for (j=0; j<nret; j++)
-        { 
+        {
             if ( ptr[j]==bcf_int32_missing || ptr[j]==bcf_int32_vector_end || ptr[j]==bcf_gt_missing ) break;
             if ( bcf_gt_allele(ptr[j]) ) dsg += 1;
         }
@@ -113,27 +150,57 @@ int calc_dosage_GT(bcf1_t *rec)
 }
 
 
-
-/* 
-    Called once at startup, allows to initialize local variables.
-    Return 1 to suppress VCF/BCF header from printing, 0 for standard
-    VCF/BCF output and -1 on critical errors.
-*/
-int init(const char *opts, bcf_hdr_t *in, bcf_hdr_t *out)
+char **split_list(char *str, int *nitems)
 {
-    int i, id;
+    int n = 0, done = 0;
+    char *ss = strdup(str), **out = NULL;
+    while ( !done && *ss )
+    {
+        char *se = ss;
+        while ( *se && *se!=',' ) se++;
+        if ( !*se ) done = 1;
+        *se = 0;
+        n++;
+        out = (char**) realloc(out,sizeof(char*)*n);
+        out[n-1] = ss;
+        ss = se+1;
+    }
+    *nitems = n;
+    return out;
+}
+
+int init(int argc, char **argv, bcf_hdr_t *in, bcf_hdr_t *out)
+{
+    int i, id, c;
+    char *tags_str = "PL,GL,GT";
+
+    static struct option loptions[] =
+    {
+        {"tags",1,0,'t'},
+        {0,0,0,0}
+    };
+    while ((c = getopt_long(argc, argv, "t:?h",loptions,NULL)) >= 0)
+    {
+        switch (c) 
+        {
+            case 't': tags_str = optarg; break;
+            case 'h':
+            case '?':
+            default: fprintf(stderr,"%s", usage()); exit(1); break;
+        }
+    }
+    tags = split_list(tags_str, &ntags);
 
     in_hdr = in;
-    tags = config_get_list(opts ? opts : "tags=PL,GL,GT","tags", &ntags);
     for (i=0; i<ntags; i++)
     {
         if ( !strcmp("PL",tags[i]) )
         {
             id = bcf_hdr_id2int(in_hdr,BCF_DT_ID,"PL");
-            if ( bcf_hdr_idinfo_exists(in_hdr,BCF_HL_FMT,id) ) 
+            if ( bcf_hdr_idinfo_exists(in_hdr,BCF_HL_FMT,id) )
             {
                 pl_type = bcf_hdr_id2type(in_hdr,BCF_HL_FMT,id);
-                if ( pl_type!=BCF_HT_INT && pl_type!=BCF_HT_REAL ) 
+                if ( pl_type!=BCF_HT_INT && pl_type!=BCF_HT_REAL )
                 {
                     fprintf(stderr,"Expected numeric type of FORMAT/PL\n");
                     return -1;
@@ -148,7 +215,7 @@ int init(const char *opts, bcf_hdr_t *in, bcf_hdr_t *out)
             if ( bcf_hdr_idinfo_exists(in_hdr,BCF_HL_FMT,id) )
             {
                 gl_type = bcf_hdr_id2type(in_hdr,BCF_HL_FMT,id);
-                if ( gl_type!=BCF_HT_INT && gl_type!=BCF_HT_REAL ) 
+                if ( gl_type!=BCF_HT_INT && gl_type!=BCF_HT_REAL )
                 {
                     fprintf(stderr,"Expected numeric type of FORMAT/GL\n");
                     return -1;
@@ -162,7 +229,7 @@ int init(const char *opts, bcf_hdr_t *in, bcf_hdr_t *out)
             handlers = (dosage_f*) realloc(handlers,(nhandlers+1)*sizeof(*handlers));
             handlers[nhandlers++] = calc_dosage_GT;
         }
-        else 
+        else
         {
             fprintf(stderr,"No handler for tag \"%s\"\n", tags[i]);
             return -1;
@@ -179,11 +246,7 @@ int init(const char *opts, bcf_hdr_t *in, bcf_hdr_t *out)
 }
 
 
-/*
-    Called for each VCF record after all standard annotation things are finished.
-    Return 0 on success, 1 to suppress the line from printing, -1 on critical errors.
-*/
-int process(bcf1_t *rec)
+bcf1_t *process(bcf1_t *rec)
 {
     int i, ret;
 
@@ -207,13 +270,10 @@ int process(bcf1_t *rec)
     }
     printf("\n");
 
-    return 1;
+    return NULL;
 }
 
 
-/*
-    Clean up.
-*/
 void destroy(void)
 {
     free(handlers);
